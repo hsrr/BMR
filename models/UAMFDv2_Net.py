@@ -113,7 +113,7 @@ def _resolve_mae_checkpoint_path(model_size, explicit_path=None):
 class UAMFD_Net(nn.Module):
     def __init__(self,
                  batch_size=64, dataset='weibo', text_token_len=197, image_token_len=197, is_use_bce=True,
-                 thresh=0.5, mae_checkpoint_path=None
+                 thresh=0.5, mae_checkpoint_path=None, text_model_name=None
                  ):
         # NOTE: NOW WE ONLY SUPPORT BASE MODEL!
         self.thresh = thresh
@@ -157,8 +157,9 @@ class UAMFD_Net(nn.Module):
         # self.image_model_finetune = nn.ModuleList(image_model_finetune)
 
         # TEXT: BERT OR PRETRAINED FROM WWW
-        english_lists = ['gossip', 'Twitter', 'politi']
-        model_name = '/root/autodl-tmp/bert-base-chinese' if self.dataset not in english_lists else '/root/autodl-tmp/bert-base-uncased'
+        english_lists = {'gossip', 'twitter', 'politi'}
+        dataset_name = str(self.dataset).lower()
+        model_name = text_model_name or ('bert-base-chinese' if dataset_name not in english_lists else 'bert-base-uncased')
         print("BERT: using {}".format(model_name))
         # if self.dataset in self.LOW_BATCH_SIZE_AND_LR:
         #     self.text_model = Block(dim=self.unified_dim, num_heads=8)

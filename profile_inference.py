@@ -43,9 +43,16 @@ def parse_args():
     parser.add_argument("--network-arch", choices=["UAMFD", "UAMFDv2"], default="UAMFDv2")
     parser.add_argument("--dataset-name", default="weibo", help="Used to select the backbone text encoder.")
     parser.add_argument("--manifest", default=None, help="JSON/JSONL/CSV/TSV manifest with text and image fields.")
+    parser.add_argument("--manifest-format", choices=["auto", "json", "jsonl", "csv", "tsv", "json-blocks"], default="auto",
+                        help="Override manifest parsing. Use json-blocks when the file stores one JSON object per block separated by blank lines.")
     parser.add_argument("--text-column", default="text", help="Manifest field containing text.")
     parser.add_argument("--image-column", default="image", help="Manifest field containing image path.")
     parser.add_argument("--label-column", default="label", help="Manifest field containing label (optional).")
+    parser.add_argument("--id-column", default="Id", help="Manifest field used to build image filenames when --image-from-id is enabled.")
+    parser.add_argument("--image-from-id", action="store_true",
+                        help="Ignore the image column and build image filename from the sample id.")
+    parser.add_argument("--image-dir", default=None, help="Directory containing images when --image-from-id is enabled.")
+    parser.add_argument("--image-suffix", default=".png", help="Image filename suffix when --image-from-id is enabled.")
     parser.add_argument("--root-dir", default=".", help="Base directory for relative image paths.")
     parser.add_argument("--max-samples", type=int, default=256, help="Maximum number of samples to profile.")
     parser.add_argument("--synthetic-samples", type=int, default=256, help="Synthetic sample count when no manifest is given.")
@@ -59,6 +66,8 @@ def parse_args():
     parser.add_argument("--text-token-length", type=int, default=197)
     parser.add_argument("--image-token-length", type=int, default=197)
     parser.add_argument("--tokenizer-name", default=None, help="Override tokenizer name. Defaults from dataset name.")
+    parser.add_argument("--text-model-name", default=None,
+                        help="Override the BERT model path/name used by the UAMFD backbone. Useful for local English checkpoints.")
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
     parser.add_argument("--num-workers", type=int, default=0,
                         help="Use 0 for strict end-to-end timing without dataloader overlap.")
@@ -160,14 +169,65 @@ def infer_synthetic_text(tokenizer_name):
     return "这是一条用于推理性能测试的合成多模态新闻样本。"
 
 
-def load_manifest_rows(manifest_path, max_samples, text_key, image_key, label_key):
+def _read_json_blocks(path):
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed.get("samples", [])
+        if isinstance(parsed, list):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    blocks = []
+    current_lines = []
+    for line in text.splitlines():
+        if line.strip():
+            current_lines.append(line)
+            continue
+        if current_lines:
+            blocks.append("\n".join(current_lines))
+            current_lines = []
+    if current_lines:
+        blocks.append("\n".join(current_lines))
+
+    return [json.loads(block) for block in blocks]
+
+
+def _resolve_manifest_format(path, manifest_format):
+    if manifest_format != "auto":
+        return manifest_format
+
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        return "jsonl"
+    if suffix == ".json":
+        return "json"
+    if suffix == ".csv":
+        return "csv"
+    if suffix == ".tsv":
+        return "tsv"
+    return "json-blocks"
+
+
+def load_manifest_rows(manifest_path, manifest_format, max_samples, text_key, image_key, label_key,
+                       id_key=None, image_from_id=False, image_dir=None, image_suffix=".png"):
     path = Path(manifest_path)
     if not path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-    suffix = path.suffix.lower()
+    manifest_format = _resolve_manifest_format(path, manifest_format)
     rows = []
-    if suffix == ".jsonl":
+    if manifest_format == ".jsonl":
+        manifest_format = "jsonl"
+    if manifest_format == ".json":
+        manifest_format = "json"
+
+    if manifest_format == "jsonl":
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -176,14 +236,11 @@ def load_manifest_rows(manifest_path, max_samples, text_key, image_key, label_ke
                 rows.append(json.loads(line))
                 if max_samples and len(rows) >= max_samples:
                     break
-    elif suffix == ".json":
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if isinstance(data, dict):
-            data = data.get("samples", [])
-        rows = list(data[:max_samples] if max_samples else data)
-    elif suffix in {".csv", ".tsv"}:
-        delimiter = "," if suffix == ".csv" else "\t"
+    elif manifest_format in {"json", "json-blocks"}:
+        rows = _read_json_blocks(path)
+        rows = list(rows[:max_samples] if max_samples else rows)
+    elif manifest_format in {"csv", "tsv"}:
+        delimiter = "," if manifest_format == "csv" else "\t"
         with path.open("r", encoding="utf-8") as handle:
             reader = csv.DictReader(handle, delimiter=delimiter)
             for row in reader:
@@ -191,14 +248,25 @@ def load_manifest_rows(manifest_path, max_samples, text_key, image_key, label_ke
                 if max_samples and len(rows) >= max_samples:
                     break
     else:
-        raise ValueError("Unsupported manifest format. Use JSON/JSONL/CSV/TSV.")
+        raise ValueError("Unsupported manifest format. Use JSON/JSONL/CSV/TSV/json-blocks.")
 
     normalized = []
+    image_dir_path = Path(image_dir) if image_dir else None
     for row in rows:
+        image_value = row.get(image_key)
+        if image_from_id:
+            if not id_key:
+                raise ValueError("--id-column must be provided when --image-from-id is enabled.")
+            sample_id = row.get(id_key)
+            if sample_id in (None, ""):
+                raise ValueError(f"Missing id field '{id_key}' in manifest row: {row}")
+            image_name = f"{sample_id}{image_suffix}"
+            image_value = str(image_dir_path / image_name) if image_dir_path else image_name
+
         normalized.append(
             {
                 "text": row.get(text_key, ""),
-                "image": row.get(image_key),
+                "image": image_value,
                 "label": row.get(label_key, -1),
             }
         )
@@ -341,6 +409,7 @@ def instantiate_model(args, device):
         batch_size=args.batch_size,
         thresh=args.thresh,
         mae_checkpoint_path=args.mae_checkpoint,
+        text_model_name=args.text_model_name,
     )
 
     if args.model_checkpoint:
@@ -609,15 +678,22 @@ def main():
     if device.type != "cuda":
         raise RuntimeError("This repository's UAMFD models use CUDA-only code paths during inference. Please benchmark on CUDA.")
     tokenizer_name = args.tokenizer_name or infer_tokenizer_name(args.dataset_name)
+    if args.text_model_name is None:
+        args.text_model_name = tokenizer_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     if args.manifest:
         samples = load_manifest_rows(
             manifest_path=args.manifest,
+            manifest_format=args.manifest_format,
             max_samples=args.max_samples,
             text_key=args.text_column,
             image_key=args.image_column,
             label_key=args.label_column,
+            id_key=args.id_column,
+            image_from_id=args.image_from_id,
+            image_dir=args.image_dir,
+            image_suffix=args.image_suffix,
         )
         synthetic = False
         synthetic_text = None
@@ -702,6 +778,7 @@ def main():
             "network_arch": args.network_arch,
             "dataset_name": args.dataset_name,
             "tokenizer_name": tokenizer_name,
+            "text_model_name": args.text_model_name,
             "num_classes": args.num_classes,
             "head_mode": "native_binary_head" if model.use_native_binary_head else "attached_linear_probe",
             "device": str(device),
@@ -711,6 +788,11 @@ def main():
             "sample_count": len(dataset),
             "synthetic_data": synthetic,
             "manifest": args.manifest,
+            "manifest_format": args.manifest_format,
+            "image_from_id": args.image_from_id,
+            "image_dir": args.image_dir,
+            "image_suffix": args.image_suffix,
+            "id_column": args.id_column,
         },
         "computation_cost": {
             "params_total": params_total,
