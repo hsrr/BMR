@@ -1,4 +1,6 @@
 from positional_encodings.torch_encodings import PositionalEncoding1D, PositionalEncoding2D, PositionalEncodingPermute3D
+import os
+import warnings
 import copy
 import pickle as pickle
 from random import sample
@@ -16,8 +18,14 @@ import torchvision.datasets as dsets
 import torchvision.transforms as transforms
 from transformers import BertModel, BertTokenizer
 # import clip
-from transformers import pipeline
-from googletrans import Translator
+try:
+    from transformers import pipeline
+except ImportError:
+    pipeline = None
+try:
+    from googletrans import Translator
+except ImportError:
+    Translator = None
 # from logger import Logger
 import models_mae
 from sklearn import metrics
@@ -87,10 +95,25 @@ class TokenAttention(torch.nn.Module):
         return outputs, scores
 
 
+def _resolve_mae_checkpoint_path(model_size, explicit_path=None):
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    env_path = os.environ.get("UAMFD_MAE_CHECKPOINT")
+    candidates = [
+        explicit_path,
+        env_path,
+        os.path.join(repo_root, "mae_pretrain_vit_{}.pth".format(model_size)),
+        "./mae_pretrain_vit_{}.pth".format(model_size),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
 class UAMFD_Net(nn.Module):
     def __init__(self,
                  batch_size=64, dataset='weibo', text_token_len=197, image_token_len=197, is_use_bce=True,
-                 thresh=0.5
+                 thresh=0.5, mae_checkpoint_path=None, text_model_name=None
                  ):
         # NOTE: NOW WE ONLY SUPPORT BASE MODEL!
         self.thresh = thresh
@@ -113,8 +136,16 @@ class UAMFD_Net(nn.Module):
         #     self.image_model = Block(dim=self.unified_dim, num_heads=8)
         # else:
         self.image_model = models_mae.__dict__["mae_vit_{}_patch16".format(self.model_size)](norm_pix_loss=False)
-        checkpoint = torch.load('./mae_pretrain_vit_{}.pth'.format(self.model_size), map_location='cpu')
-        self.image_model.load_state_dict(checkpoint['model'], strict=False)
+        checkpoint_path = _resolve_mae_checkpoint_path(self.model_size, mae_checkpoint_path)
+        if checkpoint_path is not None:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            self.image_model.load_state_dict(checkpoint['model'], strict=False)
+            print("Loaded MAE checkpoint from {}".format(checkpoint_path))
+        else:
+            warnings.warn(
+                "MAE checkpoint not found. The model will use a randomly initialized MAE encoder, "
+                "which is fine for pure latency/memory profiling but not for accuracy evaluation."
+            )
 
         # for param in self.image_model.parameters():
         #     param.requires_grad = False
@@ -126,8 +157,9 @@ class UAMFD_Net(nn.Module):
         # self.image_model_finetune = nn.ModuleList(image_model_finetune)
 
         # TEXT: BERT OR PRETRAINED FROM WWW
-        english_lists = ['gossip', 'Twitter', 'politi']
-        model_name = '/root/autodl-tmp/bert-base-chinese' if self.dataset not in english_lists else '/root/autodl-tmp/bert-base-uncased'
+        english_lists = {'gossip', 'twitter', 'politi'}
+        dataset_name = str(self.dataset).lower()
+        model_name = text_model_name or ('bert-base-chinese' if dataset_name not in english_lists else 'bert-base-uncased')
         print("BERT: using {}".format(model_name))
         # if self.dataset in self.LOW_BATCH_SIZE_AND_LR:
         #     self.text_model = Block(dim=self.unified_dim, num_heads=8)

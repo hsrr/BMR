@@ -12,7 +12,10 @@ Programmed by Aladdin Persson <aladdin.persson at hotmail dot com>
 # Imports
 import torch
 from torch import nn
-import antialiased_cnns
+try:
+    import antialiased_cnns
+except ImportError:
+    antialiased_cnns = None
 
 import numpy as np
 class GoogLeNet(nn.Module):
