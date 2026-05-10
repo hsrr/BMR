@@ -17,6 +17,7 @@ the original binary head.
 
 import argparse
 import csv
+import inspect
 import json
 import math
 import os
@@ -364,6 +365,57 @@ def load_model_state(module, checkpoint_path, strict=False):
     module.load_state_dict(clean_state, strict=strict)
 
 
+def _install_legacy_bert_redirect(text_model_name):
+    if not text_model_name:
+        return None
+
+    from transformers import BertModel
+
+    original = BertModel.from_pretrained.__func__
+    redirected_sources = {
+        "bert-base-uncased",
+        "bert-base-chinese",
+        "/root/autodl-tmp/bert-base-uncased",
+        "/root/autodl-tmp/bert-base-chinese",
+    }
+
+    def patched(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        source = str(pretrained_model_name_or_path)
+        if source in redirected_sources:
+            pretrained_model_name_or_path = text_model_name
+        return original(cls, pretrained_model_name_or_path, *model_args, **kwargs)
+
+    BertModel.from_pretrained = classmethod(patched)
+    return original
+
+
+def _restore_legacy_bert_redirect(original):
+    if original is None:
+        return
+    from transformers import BertModel
+    BertModel.from_pretrained = classmethod(original)
+
+
+def _ensure_legacy_mae_checkpoint(mae_checkpoint_path):
+    if not mae_checkpoint_path:
+        return None
+
+    target = Path(mae_checkpoint_path).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(f"MAE checkpoint not found: {target}")
+
+    legacy_path = Path.cwd() / f"mae_pretrain_vit_base.pth"
+    if legacy_path.exists():
+        return legacy_path
+
+    try:
+        legacy_path.symlink_to(target)
+    except OSError:
+        import shutil
+        shutil.copy2(target, legacy_path)
+    return legacy_path
+
+
 class UAMFDProfileWrapper(nn.Module):
     def __init__(self, backbone, num_classes=6, use_native_binary_head=False):
         super().__init__()
@@ -401,16 +453,35 @@ def instantiate_model(args, device):
     else:
         from models.UAMFD_Net import UAMFD_Net as Backbone
 
-    backbone = Backbone(
-        dataset=args.dataset_name,
-        text_token_len=args.text_token_length,
-        image_token_len=args.image_token_length,
-        is_use_bce=True,
-        batch_size=args.batch_size,
-        thresh=args.thresh,
-        mae_checkpoint_path=args.mae_checkpoint,
-        text_model_name=args.text_model_name,
-    )
+    constructor_signature = inspect.signature(Backbone.__init__)
+    constructor_kwargs = {
+        "dataset": args.dataset_name,
+        "text_token_len": args.text_token_length,
+        "image_token_len": args.image_token_length,
+        "is_use_bce": True,
+        "batch_size": args.batch_size,
+        "thresh": args.thresh,
+    }
+
+    supports_text_model_name = "text_model_name" in constructor_signature.parameters
+    supports_mae_checkpoint = "mae_checkpoint_path" in constructor_signature.parameters
+
+    legacy_bert_redirect = None
+    legacy_mae_checkpoint = None
+    if supports_text_model_name:
+        constructor_kwargs["text_model_name"] = args.text_model_name
+    else:
+        legacy_bert_redirect = _install_legacy_bert_redirect(args.text_model_name)
+
+    if supports_mae_checkpoint:
+        constructor_kwargs["mae_checkpoint_path"] = args.mae_checkpoint
+    else:
+        legacy_mae_checkpoint = _ensure_legacy_mae_checkpoint(args.mae_checkpoint)
+
+    try:
+        backbone = Backbone(**constructor_kwargs)
+    finally:
+        _restore_legacy_bert_redirect(legacy_bert_redirect)
 
     if args.model_checkpoint:
         load_model_state(backbone, args.model_checkpoint, strict=args.strict_load)
@@ -422,6 +493,8 @@ def instantiate_model(args, device):
     )
     model = model.to(device)
     model.eval()
+    if legacy_mae_checkpoint is not None:
+        model._legacy_mae_checkpoint = str(legacy_mae_checkpoint)
     return model
 
 
